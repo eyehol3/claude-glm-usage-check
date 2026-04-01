@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""Display Claude Code (Anthropic) subscription usage from the OAuth API."""
+
+import json
+import os
+import subprocess
+import sys
+import urllib.request
+from datetime import datetime, timezone
+
+API_URL = "https://api.anthropic.com/api/oauth/usage"
+TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+KEYCHAIN_SERVICE = "Claude Code-credentials"
+SCOPES = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+BETA_HEADER = "oauth-2025-04-20"
+CONFIG_DIR = os.environ.get("CLAUDE_CONFIG_DIR", os.path.expanduser("~/.claude"))
+CREDENTIALS_FILE = os.path.join(CONFIG_DIR, ".credentials.json")
+
+HELP = """\
+Usage: ccusage [-r|--remaining] [-h|--help]
+
+Display Claude Code subscription usage (session + weekly quota).
+
+Options:
+  -r, --remaining   Print remaining session quota as a number (0-100)
+  -h, --help        Show this help message
+
+Examples:
+  ccusage                 # show usage bars
+  ccusage -r              # print remaining % for pipelines
+  if [ "$(ccusage -r)" -gt 20 ]; then echo "got room"; fi
+"""
+
+
+def bar(pct, width=50):
+    filled = int(width * pct / 100)
+    return f"[{'█' * filled}{'░' * (width - filled)}]"
+
+
+def fmt_resets(iso_str):
+    dt = datetime.fromisoformat(iso_str)
+    now = datetime.now(timezone.utc)
+    diff = dt - now
+    if diff.total_seconds() <= 0:
+        return "now"
+    hours = int(diff.total_seconds() // 3600)
+    mins = int((diff.total_seconds() % 3600) // 60)
+    if hours >= 24:
+        days = hours // 24
+        return f"{days}d {hours % 24}h"
+    if hours > 0:
+        return f"{hours}h {mins}m"
+    return f"{mins}m"
+
+
+def load_tokens():
+    """Load OAuth tokens from keychain or credentials file."""
+    if sys.platform == "darwin":
+        username = os.environ.get("USER", "")
+        try:
+            result = subprocess.run(
+                ["security", "find-generic-password", "-a", username, "-w", "-s", KEYCHAIN_SERVICE],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                data = json.loads(result.stdout.strip())
+                return data.get("claudeAiOauth")
+        except (subprocess.TimeoutExpired, json.JSONDecodeError):
+            pass
+
+    try:
+        with open(CREDENTIALS_FILE) as f:
+            data = json.load(f)
+            return data.get("claudeAiOauth")
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+
+    return None
+
+
+def refresh_access_token(refresh_token):
+    body = json.dumps({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": CLIENT_ID,
+        "scope": SCOPES,
+    }).encode()
+    req = urllib.request.Request(TOKEN_URL, data=body, headers={
+        "Content-Type": "application/json",
+    })
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read())
+
+
+def fetch_usage(access_token):
+    req = urllib.request.Request(API_URL, headers={
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "anthropic-beta": BETA_HEADER,
+    })
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read())
+
+
+def get_usage():
+    tokens = load_tokens()
+    if not tokens or not tokens.get("accessToken"):
+        print("Not logged in. Run 'claude' to authenticate first.", file=sys.stderr)
+        sys.exit(1)
+
+    access_token = tokens["accessToken"]
+    try:
+        usage = fetch_usage(access_token)
+    except urllib.error.HTTPError as e:
+        if e.code == 401 and tokens.get("refreshToken"):
+            try:
+                refreshed = refresh_access_token(tokens["refreshToken"])
+                access_token = refreshed["access_token"]
+                usage = fetch_usage(access_token)
+            except Exception as ex:
+                print(f"Auth failed after refresh: {ex}", file=sys.stderr)
+                sys.exit(1)
+        else:
+            print(f"API error: {e.code} {e.reason}", file=sys.stderr)
+            sys.exit(1)
+    return usage, tokens
+
+
+def main():
+    args = sys.argv[1:]
+    if "-h" in args or "--help" in args:
+        print(HELP)
+        return
+    remaining = "-r" in args or "--remaining" in args
+
+    usage, tokens = get_usage()
+
+    if remaining:
+        fh = usage.get("five_hour") or {}
+        pct = fh.get("utilization")
+        if pct is None:
+            print("error: no session quota data", file=sys.stderr)
+            sys.exit(2)
+        print(100 - int(pct))
+        return
+
+    sub_type = (tokens.get("subscriptionType") or "unknown").upper()
+    print(f"  Claude Code Usage  [{sub_type}]")
+    print(f"  {'─' * 54}")
+
+    fh = usage.get("five_hour")
+    if fh and fh.get("utilization") is not None:
+        pct = int(fh["utilization"])
+        print(f"\n  Current session")
+        print(f"  {bar(pct)} {pct}% used")
+        print(f"  Resets {fmt_resets(fh['resets_at'])}")
+
+    sd = usage.get("seven_day")
+    if sd and sd.get("utilization") is not None:
+        pct = int(sd["utilization"])
+        print(f"\n  Current week (all models)")
+        print(f"  {bar(pct)} {pct}% used")
+        print(f"  Resets {fmt_resets(sd['resets_at'])}")
+
+    eu = usage.get("extra_usage")
+    if eu:
+        if eu.get("is_enabled"):
+            pct = int(eu["utilization"] or 0)
+            print(f"\n  Extra usage")
+            print(f"  {bar(pct)} {pct}% used")
+        else:
+            print(f"\n  Extra usage")
+            print(f"  Not enabled")
+
+    print()
+
+
+if __name__ == "__main__":
+    main()

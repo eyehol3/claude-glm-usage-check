@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""Display Z.ai GLM Coding Plan usage from the monitor API."""
+
+import json
+import os
+import sys
+import urllib.request
+from datetime import datetime, timezone
+
+ENV_FILE = os.path.expanduser("~/.config/model-proxy.env")
+API_BASE = "https://api.z.ai/api/monitor/usage"
+ENDPOINTS = {
+    "quota": f"{API_BASE}/quota/limit",
+}
+TOKEN_LIMIT_MAP = {3: "5 Hours Quota", 6: "Weekly Quota"}
+
+HELP = """\
+Usage: glmusage [-r|--remaining] [-h|--help]
+
+Display Z.ai GLM Coding Plan usage (5-hour, weekly, monthly quotas).
+
+Requires a Z.ai API key in ~/.config/model-proxy.env or the
+Z_AI_API_KEY environment variable.
+
+Options:
+  -r, --remaining   Print remaining 5-hour quota as a number (0-100)
+  -h, --help        Show this help message
+
+Examples:
+  glmusage                # show usage bars
+  glmusage -r             # print remaining % for pipelines
+  if [ "$(glmusage -r)" -gt 20 ]; then echo "got room"; fi
+"""
+
+
+def load_api_key():
+    key = os.environ.get("Z_AI_API_KEY")
+    if key:
+        return key
+    try:
+        with open(ENV_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("Z_AI_API_KEY="):
+                    return line.split("=", 1)[1].strip()
+    except FileNotFoundError:
+        pass
+    print("Error: Z_AI_API_KEY not found in env or ~/.config/model-proxy.env", file=sys.stderr)
+    sys.exit(1)
+
+
+def fetch(endpoint, api_key):
+    req = urllib.request.Request(endpoint, headers={
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+    })
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read())
+
+
+def fmt_reset(ts_ms):
+    dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+    now = datetime.now(timezone.utc)
+    diff = dt - now
+    if diff.total_seconds() < 0:
+        return "now"
+    hours = int(diff.total_seconds() // 3600)
+    mins = int((diff.total_seconds() % 3600) // 60)
+    if hours >= 24:
+        days = hours // 24
+        return f"{days}d {hours % 24}h"
+    if hours > 0:
+        return f"{hours}h {mins}m"
+    return f"{mins}m"
+
+
+def bar(pct, width=20):
+    filled = int(width * pct / 100)
+    return f"[{'█' * filled}{'░' * (width - filled)}]"
+
+
+def main():
+    args = sys.argv[1:]
+    if "-h" in args or "--help" in args:
+        print(HELP)
+        return
+    remaining = "-r" in args or "--remaining" in args
+
+    api_key = load_api_key()
+    data = fetch(ENDPOINTS["quota"], api_key)
+
+    if not data.get("success"):
+        print(f"API error: {data.get('msg', 'unknown')}", file=sys.stderr)
+        sys.exit(1)
+
+    limits = data["data"]["limits"]
+    level = data["data"].get("level", "unknown")
+
+    time_limit = next((l for l in limits if l["type"] == "TIME_LIMIT"), None)
+    token_limits = [l for l in limits if l["type"] == "TOKENS_LIMIT"]
+
+    if remaining:
+        five_hour = next((l for l in token_limits if l["unit"] == 3), None)
+        if five_hour is None:
+            print("error: no 5-hour quota data", file=sys.stderr)
+            sys.exit(2)
+        print(100 - five_hour["percentage"])
+        return
+
+    print(f"  Z.ai GLM Usage  [{level.upper()}]")
+    print(f"  {'─' * 40}")
+
+    if time_limit:
+        pct = time_limit["percentage"]
+        reset = fmt_reset(time_limit["nextResetTime"])
+        print(f"\n  Monthly Web Search / Reader / Zread Quota")
+        print(f"  {bar(pct)} {pct}%")
+        print(f"  resets in {reset}")
+
+    label_order = {"5 Hours Quota": 0, "Weekly Quota": 1}
+    labelled = []
+    for tl in token_limits:
+        label = TOKEN_LIMIT_MAP.get(tl["unit"], f"{tl['unit']}unit")
+        labelled.append((label, tl))
+    labelled.sort(key=lambda x: label_order.get(x[0], 99))
+
+    for label, tl in labelled:
+        pct = tl["percentage"]
+        reset = fmt_reset(tl["nextResetTime"])
+        print(f"\n  {label}")
+        print(f"  {bar(pct)} {pct}%")
+        print(f"  resets in {reset}")
+
+    print()
+
+
+if __name__ == "__main__":
+    main()
